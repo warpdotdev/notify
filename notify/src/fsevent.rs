@@ -537,7 +537,7 @@ unsafe fn callback_impl(
 
         let mut handle_event = false;
         for (p, (r, filt)) in &(*info).recursive_info {
-            if path.starts_with(p) && filt.should_watch(&path) {
+            if path.starts_with(p) && filt.should_emit_event(&path) {
                 if *r || &path == p {
                     handle_event = true;
                     break;

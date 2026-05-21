@@ -373,7 +373,7 @@ unsafe extern "system" fn handle_event(
             Some(ref watch_path) => *watch_path != path,
         };
 
-        skip = skip || !request.watch_filter.should_watch(&path);
+        skip = skip || !request.watch_filter.should_emit_event(&path);
 
         if !skip {
             log::trace!(

@@ -287,16 +287,40 @@ pub enum WatcherKind {
     NullWatcher,
 }
 
-type FilterFn = dyn Fn(&Path) -> bool + Send + Sync;
-/// Path filter to limit what gets watched.
+type ShouldEmitEventFn = dyn Fn(&Path) -> bool + Send + Sync;
+type ShouldWatchDirectoryFn = dyn Fn(&Path) -> bool + Send + Sync;
+
 #[derive(Clone)]
-pub struct WatchFilter(Option<Arc<FilterFn>>);
+struct Filters {
+    should_watch_directory: Arc<ShouldWatchDirectoryFn>,
+    should_emit_event: Arc<ShouldEmitEventFn>,
+}
+
+/// Path filter for [`Watcher::watch_filtered`].
+///
+/// Either accepts everything ([`WatchFilter::accept_all`]) or carries a
+/// pair of predicates ([`WatchFilter::with_filter`]):
+///
+/// * `should_watch_directory` — per-directory, consulted at recursive
+///   watch-registration time. Returning `false` means that directory and
+///   its descendants are not watched. Currently only consulted by the
+///   inotify backend (Linux/Android); other backends have no recursive
+///   registration step and ignore it.
+///
+/// * `should_emit_event` — per-event predicate. Asked for every event path
+///   on the inotify (Linux/Android), FSEvents (macOS), and
+///   ReadDirectoryChangesW (Windows) backends. Returning `false` suppresses
+///   the event. The kqueue and polling backends currently ignore this
+///   predicate.
+#[derive(Clone)]
+pub struct WatchFilter(Option<Filters>);
 
 impl std::fmt::Debug for WatchFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("WatchFilterFn")
-            .field(&self.0.as_ref().map_or("no filter", |_| "filter fn"))
-            .finish()
+        match &self.0 {
+            None => f.write_str("WatchFilter(accept_all)"),
+            Some(_) => f.write_str("WatchFilter(custom)"),
+        }
     }
 }
 
@@ -306,15 +330,51 @@ impl WatchFilter {
         WatchFilter(None)
     }
 
-    /// A fitler to limit the paths that get watched.
+    /// Construct a filter from a directory-watch predicate and an event-emit predicate.
     ///
-    /// Only paths for which `filter` returns `true` will be watched.
-    pub fn with_filter(filter: Arc<FilterFn>) -> WatchFilter {
-        WatchFilter(Some(filter))
+    /// * `should_watch_directory` — per-directory, consulted at recursive watch-registration time.
+    ///    Only directories for which this returns `true` will be watched.
+    /// * `should_emit_event` — per-event predicate.
+    ///    Only paths for which this returns `true` will emit events.
+    ///
+    /// # Invariant: monotonicity over path containment
+    ///
+    /// If `should_watch_directory(child)` returns `true`, every ancestor of
+    /// `child` up to the watched root must also return `true`.
+    /// The registration walk visits ancestors before descendants.
+    /// A rejected ancestor unreachably prunes everything beneath it.
+    pub fn with_filter(
+        should_watch_directory: Arc<ShouldWatchDirectoryFn>,
+        should_emit_event: Arc<ShouldEmitEventFn>,
+    ) -> WatchFilter {
+        WatchFilter(Some(Filters {
+            should_watch_directory,
+            should_emit_event,
+        }))
     }
 
-    fn should_watch(&self, path: &Path) -> bool {
-        self.0.as_ref().map_or(true, |f| f(path))
+    /// Returns `true` when recursive registration should watch `path`.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    pub(crate) fn should_watch_directory(&self, path: &Path) -> bool {
+        self.0
+            .as_ref()
+            .map_or(true, |f| (f.should_watch_directory)(path))
+    }
+
+    /// Returns `true` if an event for `path` should be emitted to the caller.
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            all(target_os = "macos", not(feature = "macos_kqueue")),
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn should_emit_event(&self, path: &Path) -> bool {
+        self.0
+            .as_ref()
+            .map_or(true, |f| (f.should_emit_event)(path))
     }
 }
 
@@ -491,5 +551,58 @@ mod tests {
         assert_eq!(event.paths, vec![file_path]);
 
         Ok(())
+    }
+
+    #[test]
+    fn accept_all_watches_directories_and_emits_events_everywhere() {
+        let filter = WatchFilter::accept_all();
+        let path = Path::new("/some/path");
+        assert!(filter.should_watch_directory(path));
+        assert!(filter.should_emit_event(path));
+    }
+
+    #[test]
+    fn with_filter_plumbs_directory_watch_and_event_emit_predicates() {
+        let should_watch_directory: Arc<ShouldWatchDirectoryFn> = Arc::new(|p: &Path| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("both" | "descend_only")
+            )
+        });
+        let should_emit_event: Arc<ShouldEmitEventFn> =
+            Arc::new(|p: &Path| p.file_name().and_then(|n| n.to_str()) == Some("both"));
+        let filter = WatchFilter::with_filter(should_watch_directory, should_emit_event);
+
+        assert!(filter.should_watch_directory(Path::new("/x/both")));
+        assert!(filter.should_watch_directory(Path::new("/x/descend_only")));
+        assert!(!filter.should_watch_directory(Path::new("/x/emit_only")));
+        assert!(!filter.should_watch_directory(Path::new("/x/other")));
+
+        assert!(filter.should_emit_event(Path::new("/x/both")));
+        assert!(!filter.should_emit_event(Path::new("/x/descend_only")));
+        assert!(!filter.should_emit_event(Path::new("/x/emit_only")));
+        assert!(!filter.should_emit_event(Path::new("/x/other")));
+    }
+
+    #[test]
+    fn with_filter_directory_watch_and_event_emit_are_independent() {
+        let filter = WatchFilter::with_filter(
+            Arc::new(|p: &Path| p.to_string_lossy().contains("keep")),
+            Arc::new(|p: &Path| p.file_name().and_then(|n| n.to_str()) == Some("HEAD")),
+        );
+        // Emit-only: directory watch says no, but event emit says yes.
+        let head = Path::new("/repo/.git/HEAD");
+        assert!(filter.should_emit_event(head));
+        assert!(!filter.should_watch_directory(head));
+
+        // Directory-watch-only: directory watch says yes, but event emit says no.
+        let keep = Path::new("/repo/keep/subdir");
+        assert!(!filter.should_emit_event(keep));
+        assert!(filter.should_watch_directory(keep));
+
+        // Neither: both gates reject.
+        let other = Path::new("/other");
+        assert!(!filter.should_emit_event(other));
+        assert!(!filter.should_watch_directory(other));
     }
 }

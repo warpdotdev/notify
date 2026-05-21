@@ -228,6 +228,21 @@ impl EventLoop {
                                 None => self.paths.get(&event.wd).cloned(),
                             };
 
+                            // Look up the filter for the watch descriptor that produced this event.
+                            // For child events, the descriptor belongs to the containing directory,
+                            // while `event.name` identifies the child path.
+                            let watch_filter = self
+                                .paths
+                                .get(&event.wd)
+                                .and_then(|watch_path| self.watches.get(watch_path))
+                                .map(|(_, _, _, _, watch_filter)| watch_filter);
+                            let should_emit_path = match (&path, watch_filter) {
+                                (Some(path), Some(watch_filter)) => {
+                                    watch_filter.should_emit_event(path)
+                                }
+                                _ => true,
+                            };
+
                             let mut evs = Vec::new();
 
                             if event.mask.contains(EventMask::MOVED_FROM) {
@@ -371,8 +386,12 @@ impl EventLoop {
                                 );
                             }
 
-                            for ev in evs {
-                                self.event_handler.handle_event(Ok(ev));
+                            // Apply the emit filter only at dispatch time. The event translation above also
+                            // updates recursive watch bookkeeping, so it must still run for suppressed paths
+                            if should_emit_path {
+                                for ev in evs {
+                                    self.event_handler.handle_event(Ok(ev));
+                                }
                             }
                         }
 
@@ -408,29 +427,43 @@ impl EventLoop {
         mut watch_self: bool,
         watch_filter: WatchFilter,
     ) -> Result<()> {
-        if !watch_filter.should_watch(&path) {
-            return Ok(());
-        }
-
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !is_recursive || !metadata(&path).map_err(Error::io_watch)?.is_dir() {
-            return self.add_single_watch(path, false, true, WatchFilter::accept_all());
+            return self.add_single_watch(path, false, watch_self, watch_filter);
         }
 
-        for entry in WalkDir::new(path)
+        // Recursive directory walk. Short-circuit if the root is pruned.
+        if !watch_filter.should_watch_directory(&path) {
+            return Ok(());
+        }
+
+        // We use the raw `WalkDir::IntoIter` so we can call `skip_current_dir()` for pruned entries.
+        // Non-directory entries are skipped because watches are only registered on directories
+        // (file-level events arrive through their parent's watch via `event.name`).
+        let mut iter = WalkDir::new(path)
             .follow_links(self.follow_links)
-            .into_iter()
-            .filter_map(filter_dir)
-            .filter(|e| watch_filter.should_watch(e.path()))
-        {
-            self.add_single_watch(
-                entry.path().to_path_buf(),
-                is_recursive,
-                watch_self,
-                watch_filter.clone(),
-            )?;
-            watch_self = false;
+            .into_iter();
+        while let Some(entry_result) = iter.next() {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+
+            if watch_filter.should_watch_directory(entry.path()) {
+                self.add_single_watch(
+                    entry.path().to_path_buf(),
+                    true,
+                    watch_self,
+                    watch_filter.clone(),
+                )?;
+                watch_self = false;
+            } else {
+                iter.skip_current_dir();
+            }
         }
 
         Ok(())
@@ -544,18 +577,6 @@ impl EventLoop {
         }
         Ok(())
     }
-}
-
-/// return `DirEntry` when it is a directory
-fn filter_dir(e: walkdir::Result<walkdir::DirEntry>) -> Option<walkdir::DirEntry> {
-    if let Ok(e) = e {
-        if let Ok(metadata) = e.metadata() {
-            if metadata.is_dir() {
-                return Some(e);
-            }
-        }
-    }
-    None
 }
 
 impl INotifyWatcher {
